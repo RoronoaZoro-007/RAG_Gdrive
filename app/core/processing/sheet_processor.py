@@ -19,6 +19,8 @@ from config.settings import settings
 from config.constants import SHEETS_INDEX, LLAMA_MODEL
 from core.database.metadata import MetadataManager
 from core.drive.downloader import FileDownloader
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 class SheetProcessor:
     """Handles processing of Google Sheets and Excel files using LlamaIndex."""
@@ -27,6 +29,27 @@ class SheetProcessor:
         """Initialize the sheet processor."""
         self.metadata_manager = MetadataManager()
         self.file_downloader = FileDownloader()
+        
+        # Thread-local storage for components
+        self._local = threading.local()
+    
+    def _get_parser(self):
+        """Get thread-local parser instance."""
+        if not hasattr(self._local, 'parser'):
+            self._local.parser = self.initialize_parser()
+        return self._local.parser
+    
+    def _get_llm(self):
+        """Get thread-local LLM instance."""
+        if not hasattr(self._local, 'llm'):
+            self._local.llm = self.initialize_llm()
+        return self._local.llm
+    
+    def _get_embeddings(self):
+        """Get thread-local embeddings instance."""
+        if not hasattr(self._local, 'embeddings'):
+            self._local.embeddings = self.initialize_embeddings()
+        return self._local.embeddings
     
     @staticmethod
     def _get_api_key(env_var: str, component_name: str) -> str:
@@ -214,9 +237,83 @@ class SheetProcessor:
             print(f"❌ Error creating sheets index: {str(e)}")
             return None
     
+    def _process_single_sheet(self, sheet_file, service, user_email):
+        """Process a single sheet file (for parallel processing)."""
+        try:
+            file_id = sheet_file['id']
+            file_name = sheet_file['name']
+            
+            print(f"🔄 [PARALLEL] Starting sheet processing: {file_name}")
+            
+            # Check if file has been modified
+            is_modified, existing_metadata = self.metadata_manager.check_file_modification(sheet_file, user_email)
+            
+            if is_modified:
+                print(f"🔄 [PARALLEL] File '{file_name}' has been modified, cleaning up old data...")
+                self.metadata_manager.cleanup_modified_file(file_name, user_email, file_id)
+            elif existing_metadata:
+                print(f"⏭️ [PARALLEL] Skipping already processed Sheet: {file_name}")
+                return None, "skipped"
+            
+            # Download and process sheet file immediately
+            with tempfile.TemporaryDirectory() as temp_dir:
+                sheet_path = self.file_downloader.download_sheet(service, file_id, file_name, temp_dir)
+                if not sheet_path:
+                    print(f"❌ [PARALLEL] Failed to download sheet: {file_name}")
+                    return None, "failed"
+                
+                # Process with LlamaParse immediately while file exists
+                try:
+                    parser = self._get_parser()
+                    if parser:
+                        sheet_documents = parser.load_data(sheet_path)
+                        if sheet_documents:
+                            # Add proper metadata to each sheet document
+                            for doc in sheet_documents:
+                                doc.metadata.update({
+                                    'source': file_name,
+                                    'file_id': file_id,
+                                    'file_type': 'sheet',
+                                    'processed_time': datetime.now().isoformat()
+                                })
+                            
+                            print(f"✅ [PARALLEL] Successfully processed sheet: {file_name} ({len(sheet_documents)} documents)")
+                            
+                            # Extract enhanced metadata for sheets
+                            additional_info = {
+                                "sheet_count": 1,  # Default, could be enhanced with actual sheet count
+                                "row_count": 0,  # Could be enhanced with actual row count
+                                "column_count": 0,  # Could be enhanced with actual column count
+                                "text_chunks": len(sheet_documents),
+                                "total_chunks": len(sheet_documents)
+                            }
+                            
+                            # Store enhanced metadata
+                            file_hash = hashlib.md5(f"{file_id}_{sheet_file.get('modifiedTime', '')}".encode()).hexdigest()
+                            enhanced_metadata = self.metadata_manager.extract_metadata(sheet_file, 'sheet', additional_info)
+                            self.metadata_manager.save_metadata({file_hash: enhanced_metadata}, user_email)
+                            
+                            # Process revisions (metadata only)
+                            self.metadata_manager.process_revisions(service, sheet_file, user_email)
+                            
+                            return sheet_documents, "success"
+                        else:
+                            print(f"⚠️ [PARALLEL] No documents extracted from {file_name}")
+                            return None, "failed"
+                    else:
+                        print(f"❌ [PARALLEL] Failed to initialize parser for {file_name}")
+                        return None, "failed"
+                except Exception as e:
+                    print(f"❌ [PARALLEL] Error processing {file_name} with LlamaParse: {str(e)}")
+                    return None, "failed"
+                    
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error processing sheet {sheet_file.get('name', 'unknown')}: {str(e)}")
+            return None, "failed"
+
     def process_sheets(self, credentials, user_email: str, sheet_files: list):
         """
-        Process sheet files using LlamaIndex.
+        Process sheet files using LlamaIndex with parallel processing.
         
         Args:
             credentials: Google OAuth credentials
@@ -236,79 +333,37 @@ class SheetProcessor:
             skipped_count = 0
             modified_count = 0
             
-            # Process each sheet file
-            for sheet_file in sheet_files:
-                file_id = sheet_file['id']
-                file_name = sheet_file['name']
+            if not sheet_files:
+                print("📊 No sheet files to process")
+                return None
+            
+            print(f"🚀 [PARALLEL] Starting parallel sheet processing with {len(sheet_files)} files...")
+            
+            # Parallel processing of sheets
+            with ThreadPoolExecutor(max_workers=min(4, len(sheet_files))) as executor:
+                # Submit all sheet processing tasks
+                sheet_futures = {
+                    executor.submit(self._process_single_sheet, sheet_file, service, user_email): sheet_file 
+                    for sheet_file in sheet_files
+                }
                 
-                # Check if file has been modified
-                is_modified, existing_metadata = self.metadata_manager.check_modification(sheet_file, user_email)
-                
-                if is_modified:
-                    print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
-                    self.metadata_manager.cleanup_file(file_name, user_email, file_id)
-                    modified_count += 1
-                elif existing_metadata:
-                    print(f"⏭️ Skipping already processed Sheet: {file_name}")
-                    skipped_count += 1
-                    continue
-                
-                try:
-                    # Download and process sheet file immediately
-                    with tempfile.TemporaryDirectory() as temp_dir:
-                        sheet_path = self.file_downloader.download_sheet(service, file_id, file_name, temp_dir)
-                        if sheet_path:
-                            # Process with LlamaParse immediately while file exists
-                            try:
-                                parser = self.initialize_parser()
-                                if parser:
-                                    sheet_documents = parser.load_data(sheet_path)
-                                    if sheet_documents:
-                                        # Add proper metadata to each sheet document
-                                        for doc in sheet_documents:
-                                            doc.metadata.update({
-                                                'source': file_name,
-                                                'file_id': file_id,
-                                                'file_type': 'sheet',
-                                                'processed_time': datetime.now().isoformat()
-                                            })
-                                        
-                                        all_sheet_documents.extend(sheet_documents)
-                                        processed_count += 1
-                                        print(f"✅ Successfully processed {file_name}: {len(sheet_documents)} documents")
-                                        
-                                        # Extract enhanced metadata for sheets
-                                        additional_info = {
-                                            "sheet_count": 1,  # Default, could be enhanced with actual sheet count
-                                            "row_count": 0,  # Could be enhanced with actual row count
-                                            "column_count": 0,  # Could be enhanced with actual column count
-                                            "text_chunks": len(sheet_documents),
-                                            "total_chunks": len(sheet_documents)
-                                        }
-                                        
-                                        # Store enhanced metadata
-                                        file_hash = hashlib.md5(f"{file_id}_{sheet_file.get('modifiedTime', '')}".encode()).hexdigest()
-                                        enhanced_metadata = self.metadata_manager.extract_metadata(sheet_file, 'sheet', additional_info)
-                                        self.metadata_manager.save_metadata({file_hash: enhanced_metadata}, user_email)
-                                        
-                                        # Process revisions (metadata only)
-                                        self.metadata_manager.process_revisions(service, sheet_file, user_email)
-                                    else:
-                                        print(f"⚠️ No documents extracted from {file_name}")
-                                        failed_count += 1
-                                else:
-                                    print(f"❌ Failed to initialize parser for {file_name}")
-                                    failed_count += 1
-                            except Exception as e:
-                                print(f"❌ Error processing {file_name} with LlamaParse: {str(e)}")
-                                failed_count += 1
+                # Collect results as they complete
+                for future in as_completed(sheet_futures):
+                    sheet_file = sheet_futures[future]
+                    try:
+                        result, status = future.result()
+                        if status == "success":
+                            all_sheet_documents.extend(result)
+                            processed_count += 1
+                        elif status == "skipped":
+                            skipped_count += 1
                         else:
-                            print(f"❌ Failed to download {file_name}")
                             failed_count += 1
-                            
-                except Exception as e:
-                    print(f"Error processing Sheet {file_name}: {str(e)}")
-                    failed_count += 1
+                    except Exception as e:
+                        print(f"❌ [PARALLEL] Exception in sheet processing: {str(e)}")
+                        failed_count += 1
+            
+            print(f"✅ [PARALLEL] Sheet processing completed: {processed_count} processed, {failed_count} failed, {skipped_count} skipped")
             
             # Create sheets index
             if all_sheet_documents:

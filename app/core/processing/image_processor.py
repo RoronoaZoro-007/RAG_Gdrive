@@ -12,6 +12,8 @@ import uuid
 import base64
 from config.settings import settings
 from config.constants import GEMINI_MODEL
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 class ImageProcessor:
     """Handles image processing and description generation."""
@@ -19,6 +21,15 @@ class ImageProcessor:
     def __init__(self):
         """Initialize the image processor."""
         self.model = self.init_gemini(settings.GOOGLE_API_KEY)
+        
+        # Thread-local storage for model
+        self._local = threading.local()
+    
+    def _get_model(self):
+        """Get thread-local model instance."""
+        if not hasattr(self._local, 'model'):
+            self._local.model = self.init_gemini(settings.GOOGLE_API_KEY)
+        return self._local.model
     
     def init_gemini(self, api_key: str) -> ChatGoogleGenerativeAI:
         """
@@ -72,7 +83,7 @@ class ImageProcessor:
             )
             
             # Generate description
-            response = self.model.invoke([message])
+            response = self._get_model().invoke([message])
             return response.content
             
         except Exception as e:
@@ -118,9 +129,29 @@ class ImageProcessor:
         except Exception as e:
             return []
     
+    def _process_single_image(self, img):
+        """Process a single image (for parallel processing)."""
+        try:
+            print(f"🔄 [PARALLEL] Processing image {img['image_id']} from page {img['page']}")
+            description = self.describe_image(img["image_data"])
+            if description:
+                result = {
+                    "page": img["page"],
+                    "image_id": img["image_id"],
+                    "description": description
+                }
+                print(f"✅ [PARALLEL] Successfully processed image {img['image_id']}")
+                return result
+            else:
+                print(f"❌ [PARALLEL] Failed to process image {img['image_id']}")
+                return None
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error processing image {img.get('image_id', 'unknown')}: {str(e)}")
+            return None
+
     def process_pdf_images(self, pdf_path: str) -> list:
         """
-        Process all images in a PDF and generate descriptions for each.
+        Process all images in a PDF and generate descriptions for each using parallel processing.
         
         Args:
             pdf_path (str): Path to the PDF file
@@ -131,13 +162,29 @@ class ImageProcessor:
         images = self.extract_images_from_pdf(pdf_path)
         results = []
         
-        for i, img in enumerate(images):
-            description = self.describe_image(img["image_data"])
-            if description:
-                results.append({
-                    "page": img["page"],
-                    "image_id": img["image_id"],
-                    "description": description
-                })
+        if not images:
+            print("📄 No images found in PDF")
+            return results
         
+        print(f"🚀 [PARALLEL] Starting parallel image processing for {len(images)} images...")
+        
+        # Use ThreadPoolExecutor for parallel image processing
+        with ThreadPoolExecutor(max_workers=min(4, len(images))) as executor:
+            # Submit all image processing tasks
+            image_futures = {
+                executor.submit(self._process_single_image, img): img 
+                for img in images
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(image_futures):
+                img = image_futures[future]
+                try:
+                    result = future.result()
+                    if result:
+                        results.append(result)
+                except Exception as e:
+                    print(f"❌ [PARALLEL] Exception in image processing: {str(e)}")
+        
+        print(f"✅ [PARALLEL] Image processing completed: {len(results)} successful out of {len(images)} images")
         return results 

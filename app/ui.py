@@ -282,10 +282,9 @@ def main():
             print(f"📝 [UI] Query: {prompt[:100]}{'...' if len(prompt) > 100 else ''}")
             
             # Add user message to chat history
-            st.chat_message("user").markdown(prompt)
             st.session_state.messages.append({"role": "user", "content": prompt})
             
-            # Display user message
+            # Display user message immediately
             with st.chat_message("user"):
                 st.markdown(prompt)
             
@@ -314,11 +313,7 @@ def main():
                         
                         print(f"✅ [UI] Query classified as: {query_type} (confidence: {confidence:.2f})")
                         
-                        # Show classification info in debug mode
-                        with st.expander("🔍 Query Classification Info", expanded=False):
-                            st.write(f"**Query Type:** {query_type}")
-                            st.write(f"**Confidence:** {confidence:.2f}")
-                            st.write(f"**Reasoning:** {classification.get('reasoning', 'No reasoning')}")
+
                         
                         # Use unified query system with user email
                         print(f"🔍 [UI] Calling unified query system for user: {user_email}")

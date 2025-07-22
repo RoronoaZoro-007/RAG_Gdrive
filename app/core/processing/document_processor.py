@@ -6,7 +6,7 @@ Handles text extraction, image processing, and chunking.
 import tempfile
 import hashlib
 import re
-import fitz  # PyMuPDF
+import fitz
 import streamlit as st
 import os
 from langchain_core.documents import Document
@@ -22,6 +22,8 @@ from core.drive.downloader import FileDownloader
 from core.drive.scanner import FileScanner
 from core.processing.sheet_processor import SheetProcessor
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 class DocumentProcessor:
     """Handles processing of PDF and Google Doc documents."""
@@ -37,6 +39,18 @@ class DocumentProcessor:
             model="models/embedding-001",
             google_api_key=settings.GOOGLE_API_KEY
         )
+        
+        # Thread-local storage for embeddings
+        self._local = threading.local()
+    
+    def _get_embeddings(self):
+        """Get thread-local embeddings instance."""
+        if not hasattr(self._local, 'embeddings'):
+            self._local.embeddings = GoogleGenerativeAIEmbeddings(
+                model="models/embedding-001",
+                google_api_key=settings.GOOGLE_API_KEY
+            )
+        return self._local.embeddings
     
     def extract_text_with_links(self, pdf_path: str) -> list:
         """
@@ -263,9 +277,80 @@ class DocumentProcessor:
             print(f"Error downloading Google Doc {file_name}: {str(e)}")
             return None
     
+    def _process_single_pdf(self, pdf_file, service, user_email):
+        """Process a single PDF file (for parallel processing)."""
+        try:
+            file_id = pdf_file['id']
+            file_name = pdf_file['name']
+            
+            print(f"🔄 [PARALLEL] Starting PDF processing: {file_name}")
+            
+            # Check if file has been modified
+            is_modified, existing_metadata = self.metadata_manager.check_file_modification(pdf_file, user_email)
+            
+            if is_modified:
+                print(f"🔄 [PARALLEL] File '{file_name}' has been modified, cleaning up old data...")
+                self.metadata_manager.cleanup_modified_file(file_name, user_email, file_id)
+            elif existing_metadata:
+                print(f"⏭️ [PARALLEL] Skipping already processed PDF: {file_name}")
+                return None, "skipped"
+            
+            # Download PDF
+            with tempfile.TemporaryDirectory() as temp_dir:
+                pdf_path = self.file_downloader.download_pdf(service, file_id, file_name, temp_dir)
+                if not pdf_path:
+                    print(f"❌ [PARALLEL] Failed to download PDF: {file_name}")
+                    return None, "failed"
+                
+                # Extract text and images with enhanced metadata
+                pdf_docs = self.process_pdf_with_images(pdf_path, file_name, file_id, pdf_file, user_email)
+                if pdf_docs:
+                    print(f"✅ [PARALLEL] Successfully processed PDF: {file_name} ({len(pdf_docs)} documents)")
+                    return pdf_docs, "success"
+                else:
+                    print(f"❌ [PARALLEL] Failed to process PDF: {file_name}")
+                    return None, "failed"
+                    
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error processing PDF {pdf_file.get('name', 'unknown')}: {str(e)}")
+            return None, "failed"
+    
+    def _process_single_doc(self, doc_file, service, user_email):
+        """Process a single Google Doc file (for parallel processing)."""
+        try:
+            file_id = doc_file['id']
+            file_name = doc_file['name']
+            
+            print(f"🔄 [PARALLEL] Starting Google Doc processing: {file_name}")
+            
+            # Check if file has been modified
+            is_modified, existing_metadata = self.metadata_manager.check_file_modification(doc_file, user_email)
+            
+            if is_modified:
+                print(f"🔄 [PARALLEL] File '{file_name}' has been modified, cleaning up old data...")
+                self.metadata_manager.cleanup_modified_file(file_name, user_email, file_id)
+            elif existing_metadata:
+                print(f"⏭️ [PARALLEL] Skipping already processed Google Doc: {file_name}")
+                return None, "skipped"
+            
+            # Download Google Doc content with enhanced metadata
+            doc = self.download_google_doc_content(service, file_id, file_name, doc_file, user_email)
+            if doc:
+                print(f"✅ [PARALLEL] Successfully processed Google Doc: {file_name}")
+                # Process revisions (metadata only)
+                self.metadata_manager.process_revisions(service, doc_file, user_email)
+                return [doc], "success"
+            else:
+                print(f"❌ [PARALLEL] Failed to process Google Doc: {file_name}")
+                return None, "failed"
+                
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error processing Google Doc {doc_file.get('name', 'unknown')}: {str(e)}")
+            return None, "failed"
+
     def process_all_documents(self, credentials, user_email: str, pdf_files: list, doc_files: list, sheet_files: list) -> bool:
         """
-        Process all PDF, Google Doc, and Sheet files using the unified approach.
+        Process all PDF, Google Doc, and Sheet files using parallel processing.
         
         Args:
             credentials: Google OAuth credentials
@@ -285,7 +370,7 @@ class DocumentProcessor:
             from googleapiclient.discovery import build
             service = build('drive', 'v3', credentials=credentials)
             
-            # Process files
+            # Process files using parallel processing
             documents = []
             processed_count = 0
             failed_count = 0
@@ -294,98 +379,88 @@ class DocumentProcessor:
             
             print(f"🔍 Processing {len(pdf_files)} PDF files, {len(doc_files)} Google Doc files, and {len(sheet_files)} Sheet files")
             
-            # Process PDFs
-            for pdf_file in pdf_files:
-                file_id = pdf_file['id']
-                file_name = pdf_file['name']
-                
-                # Check if file has been modified
-                is_modified, existing_metadata = self.metadata_manager.check_file_modification(pdf_file, user_email)
-                
-                if is_modified:
-                    print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
-                    self.metadata_manager.cleanup_modified_file(file_name, user_email, file_id)
-                    modified_count += 1
-                elif existing_metadata:
-                    print(f"⏭️ Skipping already processed PDF: {file_name}")
-                    skipped_count += 1
-                    continue
-                
-                try:
-                    # Download PDF
-                    with tempfile.TemporaryDirectory() as temp_dir:
-                        pdf_path = self.file_downloader.download_pdf(service, file_id, file_name, temp_dir)
-                        if not pdf_path:
+            # Parallel processing of PDFs
+            if pdf_files:
+                print(f"🚀 [PARALLEL] Starting parallel PDF processing with {len(pdf_files)} files...")
+                with ThreadPoolExecutor(max_workers=min(4, len(pdf_files))) as executor:
+                    # Submit all PDF processing tasks
+                    pdf_futures = {
+                        executor.submit(self._process_single_pdf, pdf_file, service, user_email): pdf_file 
+                        for pdf_file in pdf_files
+                    }
+                    
+                    # Collect results as they complete
+                    for future in as_completed(pdf_futures):
+                        pdf_file = pdf_futures[future]
+                        try:
+                            result, status = future.result()
+                            if status == "success":
+                                documents.extend(result)
+                                processed_count += 1
+                            elif status == "skipped":
+                                skipped_count += 1
+                            else:
+                                failed_count += 1
+                        except Exception as e:
+                            print(f"❌ [PARALLEL] Exception in PDF processing: {str(e)}")
                             failed_count += 1
-                            continue
-                        
-                        # Extract text and images with enhanced metadata
-                        pdf_docs = self.process_pdf_with_images(pdf_path, file_name, file_id, pdf_file, user_email)
-                        if pdf_docs:
-                            documents.extend(pdf_docs)
-                            processed_count += 1
-                            print(f"✅ Successfully processed {file_name}: {len(pdf_docs)} documents")
-                        else:
-                            failed_count += 1
-                            
-                except Exception as e:
-                    print(f"Error processing PDF {file_name}: {str(e)}")
-                    failed_count += 1
+                
+                print(f"✅ [PARALLEL] PDF processing completed: {processed_count} processed, {failed_count} failed, {skipped_count} skipped")
             
-            # Process Google Docs
-            for doc_file in doc_files:
-                file_id = doc_file['id']
-                file_name = doc_file['name']
+            # Parallel processing of Google Docs
+            if doc_files:
+                print(f"🚀 [PARALLEL] Starting parallel Google Doc processing with {len(doc_files)} files...")
+                with ThreadPoolExecutor(max_workers=min(4, len(doc_files))) as executor:
+                    # Submit all Google Doc processing tasks
+                    doc_futures = {
+                        executor.submit(self._process_single_doc, doc_file, service, user_email): doc_file 
+                        for doc_file in doc_files
+                    }
+                    
+                    # Collect results as they complete
+                    for future in as_completed(doc_futures):
+                        doc_file = doc_futures[future]
+                        try:
+                            result, status = future.result()
+                            if status == "success":
+                                documents.extend(result)
+                                processed_count += 1
+                            elif status == "skipped":
+                                skipped_count += 1
+                            else:
+                                failed_count += 1
+                        except Exception as e:
+                            print(f"❌ [PARALLEL] Exception in Google Doc processing: {str(e)}")
+                            failed_count += 1
                 
-                # Check if file has been modified
-                is_modified, existing_metadata = self.metadata_manager.check_file_modification(doc_file, user_email)
-                
-                if is_modified:
-                    print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
-                    self.metadata_manager.cleanup_modified_file(file_name, user_email, file_id)
-                    modified_count += 1
-                elif existing_metadata:
-                    print(f"⏭️ Skipping already processed Google Doc: {file_name}")
-                    skipped_count += 1
-                    continue
-                
-                try:
-                    # Download Google Doc content with enhanced metadata
-                    doc = self.download_google_doc_content(service, file_id, file_name, doc_file, user_email)
-                    if doc:
-                        documents.append(doc)
-                        processed_count += 1
-                        print(f"✅ Successfully processed {file_name}: 1 document")
-                        # Process revisions (metadata only)
-                        self.metadata_manager.process_revisions(service, doc_file, user_email)
-                    else:
-                        failed_count += 1
-                        
-                except Exception as e:
-                    print(f"Error processing Google Doc {file_name}: {str(e)}")
-                    failed_count += 1
+                print(f"✅ [PARALLEL] Google Doc processing completed: {processed_count} processed, {failed_count} failed, {skipped_count} skipped")
             
             # Process documents with LangChain (PDFs and Google Docs)
             if documents:
                 print(f"✅ Successfully processed {processed_count} files ({failed_count} failed, {modified_count} modified)")
                 print("🧠 Creating embeddings for documents...")
                 
-                # Apply semantic chunking to documents
+                # Apply semantic chunking to documents with parallel processing
                 text_splits = []
                 from core.processing.chunking import semantic_chunk_text
                 
-                for doc in documents:
-                    print(f"Semantically chunking document: {doc.metadata.get('source', 'unknown')}")
-                    chunks = semantic_chunk_text(doc.page_content, self.embeddings)
-                    for i, chunk in enumerate(chunks):
-                        chunk_doc = Document(
-                            page_content=chunk,
-                            metadata=doc.metadata.copy()
-                        )
-                        chunk_doc.metadata['chunk_id'] = i
-                        chunk_doc.metadata['total_chunks'] = len(chunks)
-                        chunk_doc.metadata['chunking_method'] = 'semantic'
-                        text_splits.append(chunk_doc)
+                print(f"🚀 [PARALLEL] Starting parallel semantic chunking for {len(documents)} documents...")
+                with ThreadPoolExecutor(max_workers=min(4, len(documents))) as executor:
+                    # Submit all chunking tasks
+                    chunk_futures = {
+                        executor.submit(self._chunk_single_document, doc): doc 
+                        for doc in documents
+                    }
+                    
+                    # Collect results as they complete
+                    for future in as_completed(chunk_futures):
+                        doc = chunk_futures[future]
+                        try:
+                            chunked_docs = future.result()
+                            text_splits.extend(chunked_docs)
+                            print(f"✅ [PARALLEL] Chunked document: {doc.metadata.get('source', 'unknown')} -> {len(chunked_docs)} chunks")
+                        except Exception as e:
+                            print(f"❌ [PARALLEL] Exception in chunking: {str(e)}")
                 
                 if text_splits:
                     print(f"📊 Created {len(text_splits)} semantic chunks from {len(documents)} documents")
@@ -402,9 +477,32 @@ class DocumentProcessor:
                         engine="lucene"
                     )
 
-                    # Add documents to vector store
-                    print(f"Adding {len(text_splits)} documents to PDF vector store")
-                    pdf_vectorstore.add_documents(text_splits)
+                    # Add documents to vector store with parallel processing
+                    print(f"🚀 [PARALLEL] Starting parallel vector store operations for {len(text_splits)} documents...")
+                    
+                    # Split chunks into batches for parallel processing
+                    batch_size = max(1, len(text_splits) // 4)  # 4 parallel workers
+                    chunk_batches = [text_splits[i:i + batch_size] for i in range(0, len(text_splits), batch_size)]
+                    
+                    successful_batches = 0
+                    with ThreadPoolExecutor(max_workers=min(4, len(chunk_batches))) as executor:
+                        # Submit all vector store operations
+                        vectorstore_futures = {
+                            executor.submit(self._add_documents_to_vectorstore_batch, batch, pdf_vectorstore): batch 
+                            for batch in chunk_batches
+                        }
+                        
+                        # Collect results as they complete
+                        for future in as_completed(vectorstore_futures):
+                            batch = vectorstore_futures[future]
+                            try:
+                                success = future.result()
+                                if success:
+                                    successful_batches += 1
+                            except Exception as e:
+                                print(f"❌ [PARALLEL] Exception in vector store operation: {str(e)}")
+                    
+                    print(f"✅ [PARALLEL] Vector store operations completed: {successful_batches}/{len(chunk_batches)} batches successful")
                     
                     # Store the vector store in session state for later use
                     st.session_state.pdf_vectorstore = pdf_vectorstore
@@ -420,6 +518,56 @@ class DocumentProcessor:
                 
         except Exception as e:
             print(f"Error processing documents: {str(e)}")
+            return False
+    
+    def _chunk_single_document(self, doc):
+        """Chunk a single document (for parallel processing)."""
+        try:
+            from core.processing.chunking import semantic_chunk_text
+            print(f"🔄 [PARALLEL] Chunking document: {doc.metadata.get('source', 'unknown')}")
+            chunks = semantic_chunk_text(doc.page_content, self._get_embeddings())
+            chunked_docs = []
+            for i, chunk in enumerate(chunks):
+                chunk_doc = Document(
+                    page_content=chunk,
+                    metadata=doc.metadata.copy()
+                )
+                chunk_doc.metadata['chunk_id'] = i
+                chunk_doc.metadata['total_chunks'] = len(chunks)
+                chunk_doc.metadata['chunking_method'] = 'semantic'
+                chunked_docs.append(chunk_doc)
+            return chunked_docs
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error chunking document: {str(e)}")
+            return []
+
+    def _generate_embeddings_batch(self, chunk_batch):
+        """Generate embeddings for a batch of chunks (for parallel processing)."""
+        try:
+            print(f"🔄 [PARALLEL] Generating embeddings for batch of {len(chunk_batch)} chunks")
+            embeddings = self._get_embeddings()
+            
+            # Extract text content from chunks
+            texts = [chunk.page_content for chunk in chunk_batch]
+            
+            # Generate embeddings in batch
+            batch_embeddings = embeddings.embed_documents(texts)
+            
+            print(f"✅ [PARALLEL] Successfully generated embeddings for batch of {len(chunk_batch)} chunks")
+            return batch_embeddings
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error generating embeddings for batch: {str(e)}")
+            return []
+
+    def _add_documents_to_vectorstore_batch(self, chunk_batch, vectorstore):
+        """Add a batch of documents to vector store (for parallel processing)."""
+        try:
+            print(f"🔄 [PARALLEL] Adding batch of {len(chunk_batch)} documents to vector store")
+            vectorstore.add_documents(chunk_batch)
+            print(f"✅ [PARALLEL] Successfully added batch of {len(chunk_batch)} documents to vector store")
+            return True
+        except Exception as e:
+            print(f"❌ [PARALLEL] Error adding documents to vector store: {str(e)}")
             return False
 
 def process_all_user_documents_unified(credentials, user_email):
@@ -514,103 +662,21 @@ def process_all_user_documents_unified(credentials, user_email):
         else:
             print(f"❌ [DEBUG] process_all_documents failed")
         
-        # Process sheets with LlamaIndex (individual processing like in original)
+        # Process sheets with LlamaIndex using parallel processing
         all_sheet_documents = []
         if sheet_files:
-            st.info("📊 Processing sheets with LlamaIndex...")
+            st.info("📊 Processing sheets with LlamaIndex using parallel processing...")
             
             try:
-                # Process each sheet individually like in the original
-                for sheet_file in sheet_files:
-                    file_id = sheet_file['id']
-                    file_name = sheet_file['name']
-                    
-                    # Check if file has been modified
-                    print(f"🔍 [PROCESSING] Checking sheet modification for user: {user_email}")
-                    is_modified, existing_metadata = metadata_manager.check_file_modification(sheet_file, user_email)
-                    
-                    if is_modified:
-                        print(f"🔄 File '{file_name}' has been modified, cleaning up old data...")
-                        metadata_manager.cleanup_modified_file(file_name, user_email, file_id)
-                        modified_count += 1
-                    elif existing_metadata:
-                        print(f"⏭️ Skipping already processed Sheet: {file_name}")
-                        skipped_count += 1
-                        continue
-                    
-                    try:
-                        st.session_state.processing_status = f"📊 Processing Sheet: {file_name}"
-                        
-                        # Download and process sheet file immediately
-                        with tempfile.TemporaryDirectory() as temp_dir:
-                            sheet_path = file_downloader.download_sheet(service, file_id, file_name, temp_dir)
-                            if sheet_path:
-                                # Process with LlamaParse immediately while file exists
-                                try:
-                                    from llama_parse import LlamaParse
-                                    from config.settings import settings
-                                    parser = LlamaParse(api_key=settings.LLAMA_CLOUD_API_KEY)
-                                    if parser:
-                                        sheet_documents = parser.load_data(sheet_path)
-                                        if sheet_documents:
-                                            # Add proper metadata to each sheet document
-                                            for doc in sheet_documents:
-                                                doc.metadata.update({
-                                                    'source': file_name,
-                                                    'file_id': file_id,
-                                                    'file_type': 'sheet',
-                                                    'processed_time': datetime.now().isoformat()
-                                                })
-                                            
-                                            all_sheet_documents.extend(sheet_documents)
-                                            processed_count += 1
-                                            print(f"✅ Successfully processed {file_name}: {len(sheet_documents)} documents")
-                                            
-                                            # Extract enhanced metadata for sheets
-                                            additional_info = {
-                                                "sheet_count": 1,
-                                                "row_count": 0,
-                                                "column_count": 0,
-                                                "text_chunks": len(sheet_documents),
-                                                "total_chunks": len(sheet_documents)
-                                            }
-                                            
-                                            # Store enhanced metadata
-                                            file_hash = hashlib.md5(f"{file_id}_{sheet_file.get('modifiedTime', '')}".encode()).hexdigest()
-                                            enhanced_metadata = metadata_manager.extract_metadata(sheet_file, 'sheet', additional_info)
-                                            print(f"🔍 [PROCESSING] Saving sheet metadata for user: {user_email}")
-                                            metadata_manager.save_metadata({file_hash: enhanced_metadata}, user_email)
-                                            
-                                            # Process revisions (metadata only)
-                                            metadata_manager.process_revisions(service, sheet_file, user_email)
-                                        else:
-                                            print(f"⚠️ No documents extracted from {file_name}")
-                                            failed_count += 1
-                                    else:
-                                        print(f"❌ Failed to initialize parser for {file_name}")
-                                        failed_count += 1
-                                except Exception as e:
-                                    print(f"❌ Error processing {file_name} with LlamaParse: {str(e)}")
-                                    failed_count += 1
-                            else:
-                                print(f"❌ Failed to download {file_name}")
-                                failed_count += 1
-                                
-                    except Exception as e:
-                        print(f"Error processing Sheet {file_name}: {str(e)}")
-                        failed_count += 1
+                # Use the new parallel sheet processing
+                sheet_processor = SheetProcessor()
+                sheets_index = sheet_processor.process_sheets(credentials, user_email, sheet_files)
                 
-                # Create sheets index if we have documents
-                if all_sheet_documents:
-                    sheet_processor = SheetProcessor()
-                    sheets_index = sheet_processor.create_sheets_index(all_sheet_documents)
-                    if sheets_index:
-                        st.session_state.processed_sheets = True
-                        st.session_state.sheets_index = sheets_index  # Store in session state
-                        print("✅ Sheets index stored in session state")
-                        st.success("✅ Sheets index created successfully!")
-                    else:
-                        st.error("❌ Failed to create sheets index")
+                if sheets_index:
+                    st.session_state.processed_sheets = True
+                    st.session_state.sheets_index = sheets_index  # Store in session state
+                    print("✅ Sheets index stored in session state")
+                    st.success("✅ Sheets index created successfully with parallel processing!")
                 else:
                     st.warning("⚠️ No sheet documents were processed successfully")
                     
